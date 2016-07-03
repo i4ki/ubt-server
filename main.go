@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"sync"
+	"time"
 )
 
 type (
@@ -32,6 +34,11 @@ type (
 		Status string     `json:"status"`
 		Code   StatusCode `json:"code"`
 	}
+
+	selectMessage struct {
+		Character string `json:"character"`
+		player    string `json:"player"`
+	}
 )
 
 const (
@@ -49,6 +56,7 @@ const (
 const (
 	ESuccess StatusCode = iota + 1
 	ETooManyPlayers
+	ESelect
 )
 
 func (c Character) String() string {
@@ -108,24 +116,27 @@ func toManyPlayers(conn net.Conn) {
 	conn.Write(msg)
 }
 
-func connectionSuccess(conn net.Conn) error {
-	connSuccess := statusMessage{
-		Status: "connection successfully",
-		Code:   ESuccess,
-	}
-
-	data, err := json.Marshal(&connSuccess)
+func sendMessage(conn net.Conn, message statusMessage) error {
+	data, err := json.Marshal(&message)
 
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Marshaled data: %s\n", string(data))
+	_, err = conn.Write(data)
 
-	// Write message of connection successfully
-	conn.Write(data)
+	fmt.Printf("Sent message: %s\n", string(data))
 
-	return nil
+	return err
+}
+
+func sendSuccess(conn net.Conn) error {
+	connSuccess := statusMessage{
+		Status: "connection successfully",
+		Code:   ESuccess,
+	}
+
+	return sendMessage(conn, connSuccess)
 }
 
 func getPlayer(conn net.Conn) (Player, error) {
@@ -147,6 +158,37 @@ func getPlayer(conn net.Conn) (Player, error) {
 	}
 
 	return player, nil
+}
+
+func getPlayerCharSelect(conn net.Conn) (Character, error) {
+	buf := make([]byte, 1024)
+
+	n, err := conn.Read(buf)
+
+	if err != nil {
+		return 0, err
+	}
+
+	fmt.Printf("Received: %s\n", string(buf[:n]))
+
+	var message selectMessage
+	err = json.Unmarshal(buf[:n], &message)
+
+	if err != nil {
+		return 0, err
+	}
+
+	if message.Character == "" {
+		return 0, errors.New("Empty character name")
+	}
+
+	if message.Character == "drax" {
+		return Drax, nil
+	} else if message.Character == "max" {
+		return Max, nil
+	}
+
+	return 0, errors.New("invalid character choice")
 }
 
 func handleRequest(conn net.Conn, game *GameState) {
@@ -176,6 +218,8 @@ func handleRequest(conn net.Conn, game *GameState) {
 		return
 	}
 
+	player.state = stateSelect
+
 	fmt.Printf("Player connected: %s\n", player.Name)
 
 	game.players[playerName(player.Name)] = &player
@@ -185,22 +229,40 @@ func handleRequest(conn net.Conn, game *GameState) {
 	for {
 		switch player.state {
 		case stateSelect:
-			getPlayerCharSelect(conn, &player)
+			char, err := getPlayerCharSelect(conn)
+
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: %s\n", err.Error())
+
+				errMessage := statusMessage{
+					Status: err.Error(),
+					Code:   ESelect,
+				}
+
+				err = sendMessage(conn, errMessage)
+
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR: %s\n", err.Error())
+				}
+			}
+
+			player.Character = char
+
+			err = sendSuccess(conn)
+
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ERROR: %s\n", err.Error())
+			}
+
+			player.state = stateWaitPlayers
 		case stateWaitPlayers:
-			// todo
+			fmt.Printf("Waiting other players...\n")
+			time.Sleep(3 * time.Second)
 		case stateSync: // validate players and then enter the game
 		case statePlay:
 			// todo
+		default:
+			fmt.Printf("Wrong state: %v\n", player.state)
 		}
-
-		reqLen, err := conn.Read(buf)
-
-		if err != nil {
-			fmt.Println("Error reading:", err.Error())
-		}
-
-		fmt.Printf("Message received: %s(%d)\n", string(buf), reqLen)
-
-		conn.Write([]byte("Message received."))
 	}
 }
